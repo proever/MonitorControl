@@ -1,0 +1,128 @@
+name: Test build
+
+# Builds an ad-hoc signed MonitorControl.app for trying out a branch locally and
+# publishes it as a workflow artifact and a GitHub prerelease. Fork-only tooling,
+# not meant to be sent upstream.
+
+on:
+  push:
+    branches:
+      - 'cursor/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Prepare
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          {
+            echo "SHORT_SHA=$short_sha"
+            echo "TAG=test-build-$short_sha"
+            echo "APP=$RUNNER_TEMP/DerivedData/Build/Products/Release/MonitorControl.app"
+            echo "ZIP=$RUNNER_TEMP/MonitorControl-test-$short_sha.zip"
+          } >> "$GITHUB_ENV"
+          xcodebuild -version
+          # The project's SwiftFormat/SwiftLint build phases run whenever the tools are
+          # installed, and SwiftFormat rewrites the sources before they are compiled.
+          for tool in swiftformat swiftlint; do
+            while tool_path="$(PATH="$PATH:/opt/homebrew/bin" command -v "$tool")"; do
+              sudo mv "$tool_path" "$tool_path.disabled"
+            done
+          done
+
+      - name: Build (Release, ad-hoc signed)
+        run: |
+          # Ad-hoc signed code has no Team ID, which the hardened runtime's library
+          # validation requires of embedded frameworks such as Sparkle.
+          xcodebuild build \
+            -project MonitorControl.xcodeproj \
+            -scheme MonitorControl \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY=- \
+            DEVELOPMENT_TEAM= \
+            PROVISIONING_PROFILE_SPECIFIER= \
+            ENABLE_HARDENED_RUNTIME=NO
+          git status --short
+          git diff --exit-code -- '*.swift'
+
+      - name: Package and check
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+          (cd "$(dirname "$ZIP")" && shasum -a 256 "$(basename "$ZIP")") | tee "$ZIP.sha256"
+          {
+            echo "APP_VERSION=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+            echo "APP_BUILD=$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "$APP/Contents/Info.plist")"
+            echo "XCODE_VERSION=$(xcodebuild -version | head -1)"
+            echo "MACOS_VERSION=$(sw_vers -productVersion)"
+          } >> "$GITHUB_ENV"
+          # Check the archive as it will be downloaded: intact signature, and the app
+          # is still running a few seconds after launch.
+          mkdir "$RUNNER_TEMP/check"
+          ditto -x -k "$ZIP" "$RUNNER_TEMP/check"
+          app="$RUNNER_TEMP/check/MonitorControl.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv "$app" 2>&1 | grep -E '^(Identifier|Format|CodeDirectory|Signature|TeamIdentifier)'
+          lipo -archs "$app/Contents/MacOS/MonitorControl"
+          "$app/Contents/MacOS/MonitorControl" &
+          pid=$!
+          sleep 15
+          if ! kill -0 "$pid" 2>/dev/null; then
+            status=0
+            wait "$pid" || status=$?
+            echo "::error::MonitorControl exited during launch (status $status)"
+            exit 1
+          fi
+          kill "$pid"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          path: ${{ env.ZIP }}
+          archive: false
+          if-no-files-found: error
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zip_name="$(basename "$ZIP")"
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          Ad-hoc signed **test build** of MonitorControl from \`${GITHUB_REF_NAME}\` at ${GITHUB_SHA}. It is not notarized and not an official release.
+
+          - Version ${APP_VERSION} (${APP_BUILD}), universal (Apple Silicon and Intel), built with ${XCODE_VERSION} on macOS ${MACOS_VERSION}
+          - Checksum: \`${zip_name}.sha256\`
+
+          ### Install
+          1. Quit MonitorControl if it is running (menu bar icon > Quit).
+          2. Unzip ${zip_name} and replace /Applications/MonitorControl.app with the test build (keep the old copy to go back).
+          3. Clear the download quarantine so Gatekeeper lets the ad-hoc signed app start: \`xattr -dr com.apple.quarantine /Applications/MonitorControl.app\`. Alternatively open it once, then use System Settings > Privacy & Security > Open Anyway; right-click > Open no longer bypasses Gatekeeper on macOS 15 and later.
+          4. Open it and grant Accessibility again: macOS ties the permission to the code signature, so the official build's grant does not apply. If MonitorControl is already listed in System Settings > Privacy & Security > Accessibility, remove it with "-", add the test build, and restart the app. Every new test build needs this again.
+
+          Settings carry over: the test build has the same bundle identifier (app.monitorcontrol.MonitorControl), so it reads and writes the official app's preferences.
+
+          ### Go back
+          Quit the test build, restore the official MonitorControl.app (or reinstall it from https://github.com/MonitorControl/MonitorControl/releases) and grant Accessibility to it again.
+          EOF
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" "$ZIP" "$ZIP.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --latest=false \
+            --title "Test build ${SHORT_SHA} (${GITHUB_REF_NAME})" \
+            --notes-file "$RUNNER_TEMP/notes.md"
+          echo "Download: https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${zip_name}" | tee -a "$GITHUB_STEP_SUMMARY"

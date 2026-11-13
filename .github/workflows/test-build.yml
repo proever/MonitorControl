@@ -57,7 +57,6 @@ jobs:
             -derivedDataPath "$RUNNER_TEMP/DerivedData" \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY=- \
-            'CODE_SIGN_IDENTITY[sdk=macosx*]=-' \
             DEVELOPMENT_TEAM= \
             PROVISIONING_PROFILE_SPECIFIER= \
             ENABLE_HARDENED_RUNTIME=NO
